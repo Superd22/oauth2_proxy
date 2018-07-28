@@ -7,6 +7,9 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path"
+	"strconv"
+	"strings"
 )
 
 type GitHubProvider struct {
@@ -31,11 +34,12 @@ func NewGitHubProvider(p *ProviderData) *GitHubProvider {
 			Path:   "/login/oauth/access_token",
 		}
 	}
+	// ValidationURL is the API Base URL
 	if p.ValidateURL == nil || p.ValidateURL.String() == "" {
 		p.ValidateURL = &url.URL{
 			Scheme: "https",
 			Host:   "api.github.com",
-			Path:   "/user/emails",
+			Path:   "/",
 		}
 	}
 	if p.Scope == "" {
@@ -58,30 +62,51 @@ func (p *GitHubProvider) hasOrg(accessToken string) (bool, error) {
 		Login string `json:"login"`
 	}
 
-	params := url.Values{
-		"access_token": {accessToken},
-		"limit":        {"100"},
+	type orgsPage []struct {
+		Login string `json:"login"`
 	}
 
-	endpoint := "https://api.github.com/user/orgs?" + params.Encode()
-	req, _ := http.NewRequest("GET", endpoint, nil)
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return false, err
-	}
+	pn := 1
+	for {
+		params := url.Values{
+			"limit": {"200"},
+			"page":  {strconv.Itoa(pn)},
+		}
 
-	body, err := ioutil.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		return false, err
-	}
-	if resp.StatusCode != 200 {
-		return false, fmt.Errorf("got %d from %q %s", resp.StatusCode, endpoint, body)
-	}
+		endpoint := &url.URL{
+			Scheme:   p.ValidateURL.Scheme,
+			Host:     p.ValidateURL.Host,
+			Path:     path.Join(p.ValidateURL.Path, "/user/orgs"),
+			RawQuery: params.Encode(),
+		}
+		req, _ := http.NewRequest("GET", endpoint.String(), nil)
+		req.Header.Set("Accept", "application/vnd.github.v3+json")
+		req.Header.Set("Authorization", fmt.Sprintf("token %s", accessToken))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return false, err
+		}
 
-	if err := json.Unmarshal(body, &orgs); err != nil {
-		return false, err
+		body, err := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return false, err
+		}
+		if resp.StatusCode != 200 {
+			return false, fmt.Errorf(
+				"got %d from %q %s", resp.StatusCode, endpoint.String(), body)
+		}
+
+		var op orgsPage
+		if err := json.Unmarshal(body, &op); err != nil {
+			return false, err
+		}
+		if len(op) == 0 {
+			break
+		}
+
+		orgs = append(orgs, op...)
+		pn += 1
 	}
 
 	var presentOrgs []string
@@ -109,13 +134,18 @@ func (p *GitHubProvider) hasOrgAndTeam(accessToken string) (bool, error) {
 	}
 
 	params := url.Values{
-		"access_token": {accessToken},
-		"limit":        {"100"},
+		"limit": {"200"},
 	}
 
-	endpoint := "https://api.github.com/user/teams?" + params.Encode()
-	req, _ := http.NewRequest("GET", endpoint, nil)
+	endpoint := &url.URL{
+		Scheme:   p.ValidateURL.Scheme,
+		Host:     p.ValidateURL.Host,
+		Path:     path.Join(p.ValidateURL.Path, "/user/teams"),
+		RawQuery: params.Encode(),
+	}
+	req, _ := http.NewRequest("GET", endpoint.String(), nil)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("Authorization", fmt.Sprintf("token %s", accessToken))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return false, err
@@ -127,7 +157,8 @@ func (p *GitHubProvider) hasOrgAndTeam(accessToken string) (bool, error) {
 		return false, err
 	}
 	if resp.StatusCode != 200 {
-		return false, fmt.Errorf("got %d from %q %s", resp.StatusCode, endpoint, body)
+		return false, fmt.Errorf(
+			"got %d from %q %s", resp.StatusCode, endpoint.String(), body)
 	}
 
 	if err := json.Unmarshal(body, &teams); err != nil {
@@ -141,9 +172,12 @@ func (p *GitHubProvider) hasOrgAndTeam(accessToken string) (bool, error) {
 		presentOrgs[team.Org.Login] = true
 		if p.Org == team.Org.Login {
 			hasOrg = true
-			if p.Team == team.Slug {
-				log.Printf("Found Github Organization:%q Team:%q (Name:%q)", team.Org.Login, team.Slug, team.Name)
-				return true, nil
+			ts := strings.Split(p.Team, ",")
+			for _, t := range ts {
+				if t == team.Slug {
+					log.Printf("Found Github Organization:%q Team:%q (Name:%q)", team.Org.Login, team.Slug, team.Name)
+					return true, nil
+				}
 			}
 			presentTeams = append(presentTeams, team.Slug)
 		}
@@ -180,11 +214,14 @@ func (p *GitHubProvider) GetEmailAddress(s *SessionState) (string, error) {
 		}
 	}
 
-	params := url.Values{
-		"access_token": {s.AccessToken},
+	endpoint := &url.URL{
+		Scheme: p.ValidateURL.Scheme,
+		Host:   p.ValidateURL.Host,
+		Path:   path.Join(p.ValidateURL.Path, "/user/emails"),
 	}
-	endpoint := "https://api.github.com/user/emails?" + params.Encode()
-	resp, err := http.DefaultClient.Get(endpoint)
+	req, _ := http.NewRequest("GET", endpoint.String(), nil)
+	req.Header.Set("Authorization", fmt.Sprintf("token %s", s.AccessToken))
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -195,10 +232,11 @@ func (p *GitHubProvider) GetEmailAddress(s *SessionState) (string, error) {
 	}
 
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("got %d from %q %s", resp.StatusCode, endpoint, body)
-	} else {
-		log.Printf("got %d from %q %s", resp.StatusCode, endpoint, body)
+		return "", fmt.Errorf("got %d from %q %s",
+			resp.StatusCode, endpoint.String(), body)
 	}
+
+	log.Printf("got %d from %q %s", resp.StatusCode, endpoint.String(), body)
 
 	if err := json.Unmarshal(body, &emails); err != nil {
 		return "", fmt.Errorf("%s unmarshaling %s", err, body)
@@ -211,4 +249,47 @@ func (p *GitHubProvider) GetEmailAddress(s *SessionState) (string, error) {
 	}
 
 	return "", nil
+}
+
+func (p *GitHubProvider) GetUserName(s *SessionState) (string, error) {
+	var user struct {
+		Login string `json:"login"`
+		Email string `json:"email"`
+	}
+
+	endpoint := &url.URL{
+		Scheme: p.ValidateURL.Scheme,
+		Host:   p.ValidateURL.Host,
+		Path:   path.Join(p.ValidateURL.Path, "/user"),
+	}
+
+	req, err := http.NewRequest("GET", endpoint.String(), nil)
+	if err != nil {
+		return "", fmt.Errorf("could not create new GET request: %v", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("token %s", s.AccessToken))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	defer resp.Body.Close()
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("got %d from %q %s",
+			resp.StatusCode, endpoint.String(), body)
+	}
+
+	log.Printf("got %d from %q %s", resp.StatusCode, endpoint.String(), body)
+
+	if err := json.Unmarshal(body, &user); err != nil {
+		return "", fmt.Errorf("%s unmarshaling %s", err, body)
+	}
+
+	return user.Login, nil
 }
